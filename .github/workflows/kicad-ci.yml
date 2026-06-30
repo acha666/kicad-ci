@@ -781,7 +781,7 @@ jobs:
             \( "outputs/png/${PROJECT_NAME}-F.Silkscreen.png" -alpha set -channel A -evaluate multiply 0.95 \) \
             \( "outputs/png/${PROJECT_NAME}-F.Fab.png"        -alpha set -channel A -evaluate multiply 0.95 \) \
             \( "outputs/png/${PROJECT_NAME}-Edge.Cuts.png"    -alpha set -channel A -evaluate multiply 1.00 \) \
-            -background none -layers merge +repage "outputs/png/${PROJECT_NAME}-top.png"
+            +channel -background none -layers merge +repage "outputs/png/${PROJECT_NAME}-top.png"
 
           "${im_convert[@]}" \
             \( "outputs/png/${PROJECT_NAME}-B.Cu.png"               -alpha set -channel A -evaluate multiply 1.00 \) \
@@ -790,7 +790,7 @@ jobs:
             \( "outputs/png/${PROJECT_NAME}-B.Silkscreen.png"       -alpha set -channel A -evaluate multiply 0.90 \) \
             \( "outputs/png/${PROJECT_NAME}-B.Fab.png"              -alpha set -channel A -evaluate multiply 0.95 \) \
             \( "outputs/png/${PROJECT_NAME}-Edge.Cuts-mirrored.png" -alpha set -channel A -evaluate multiply 1.00 \) \
-            -background none -layers merge +repage "outputs/png/${PROJECT_NAME}-bottom.png"
+            +channel -background none -layers merge +repage "outputs/png/${PROJECT_NAME}-bottom.png"
 
       - name: Render schematic preview PNG
         run: |
