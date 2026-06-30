@@ -632,8 +632,6 @@ jobs:
 
           step_file="outputs/step/${PROJECT_NAME}.step"
 
-          rm -f "$step_file" "$vrml_file"
-
           set +e
           kicad-cli pcb export step \
             -o "$step_file" \
