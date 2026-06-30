@@ -659,7 +659,7 @@ jobs:
           kicad-cli pcb export vrml \
             -o "outputs/vrml/${PROJECT_NAME}.wrl" \
             --units mm \
-            --models-dir "outputs/vrml/${PROJECT_NAME}.wrl.modules" \
+            --models-dir "${PROJECT_NAME}.wrl.modules" \
             --models-relative \
             "${define_args[@]}" \
             "${variant_args[@]}" \
