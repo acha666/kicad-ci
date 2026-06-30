@@ -433,7 +433,7 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates imagemagick inkscape jq tzdata zip
+          apt-get install -y --no-install-recommends ca-certificates imagemagick inkscape jq poppler-utils tzdata zip
 
       - name: Configure timezone
         run: |
@@ -797,10 +797,77 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
 
-          inkscape \
-            --export-filename "outputs/png/${PROJECT_NAME}-schematic.png" \
-            --export-dpi 384 \
-            "outputs/schematic/${PROJECT_NAME}-schematic.pdf"
+          pdf="outputs/schematic/${PROJECT_NAME}-schematic.pdf"
+          output_png="outputs/png/${PROJECT_NAME}-schematic.png"
+          output_base="${output_png%.png}"
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf "$tmp_dir"' EXIT
+
+          if [[ ! -s "$pdf" ]]; then
+            echo "::error::Schematic PDF not found or empty: $pdf"
+            exit 1
+          fi
+
+          page_count="$(pdfinfo "$pdf" | awk '/^Pages:/ {print $2}')"
+
+          if [[ -z "$page_count" || ! "$page_count" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not determine schematic PDF page count: $pdf"
+            exit 1
+          fi
+
+          if (( page_count < 1 )); then
+            echo "::error::Schematic PDF has no pages: $pdf"
+            exit 1
+          fi
+
+          echo "::notice::Schematic PDF page count: $page_count"
+
+          if (( page_count == 1 )); then
+            pdftocairo \
+              -png \
+              -singlefile \
+              -r 384 \
+              "$pdf" \
+              "$output_base"
+          else
+            pdftocairo \
+              -png \
+              -r 384 \
+              "$pdf" \
+              "$tmp_dir/schematic-page"
+
+            mapfile -d '' page_pngs < <(
+              find "$tmp_dir" \
+                -maxdepth 1 \
+                -type f \
+                -name 'schematic-page-*.png' \
+                -print0 \
+                | sort -z -V
+            )
+
+            if [[ "${#page_pngs[@]}" -ne "$page_count" ]]; then
+              echo "::error::Expected $page_count rendered schematic page PNGs, got ${#page_pngs[@]}."
+              echo "::error::Rendered files:"
+              find "$tmp_dir" -maxdepth 1 -type f -print | sort -V
+              exit 1
+            fi
+
+            if command -v magick >/dev/null 2>&1; then
+              im_convert=(magick)
+            else
+              im_convert=(convert)
+            fi
+
+            "${im_convert[@]}" \
+              "${page_pngs[@]}" \
+              -background white \
+              -alpha remove \
+              -alpha off \
+              -append \
+              "$output_png"
+          fi
+
+          test -s "$output_png"
 
       - name: Assemble release assets
         id: assemble-assets
