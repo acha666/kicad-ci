@@ -631,7 +631,6 @@ jobs:
           init_kicad_cli_args
 
           step_file="outputs/step/${PROJECT_NAME}.step"
-          vrml_file="outputs/vrml/${PROJECT_NAME}.wrl"
 
           rm -f "$step_file" "$vrml_file"
 
@@ -659,26 +658,14 @@ jobs:
             fi
           fi
 
-          set +e
           kicad-cli pcb export vrml \
-            -o "$vrml_file" \
+            -o "outputs/vrml/${PROJECT_NAME}.wrl" \
             --units mm \
             --models-dir "outputs/vrml/${PROJECT_NAME}.wrl.modules" \
             --models-relative \
             "${define_args[@]}" \
             "${variant_args[@]}" \
             "$BOARD_FILE"
-          vrml_status=$?
-          set -e
-
-          if [[ "$vrml_status" -ne 0 ]]; then
-            if [[ -s "$vrml_file" ]]; then
-              echo "::warning::KiCad VRML export returned exit code $vrml_status, but '$vrml_file' was created and is non-empty. Continuing."
-            else
-              echo "::error::KiCad VRML export failed with exit code $vrml_status and '$vrml_file' was not created."
-              exit "$vrml_status"
-            fi
-          fi
 
       - name: Export board SVG layers
         env:
