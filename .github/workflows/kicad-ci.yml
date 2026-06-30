@@ -1,0 +1,934 @@
+name: KiCad PCB CI (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        description: Root KiCad project name, without extension.
+        required: true
+        type: string
+      project_directory:
+        description: Directory containing the KiCad project files, relative to the repository root.
+        required: false
+        default: "."
+        type: string
+      board_file:
+        description: Board filename or relative path from project_directory. Defaults to <project_name>.kicad_pcb.
+        required: false
+        default: ""
+        type: string
+      schematic_file:
+        description: Schematic filename or relative path from project_directory. Defaults to <project_name>.kicad_sch.
+        required: false
+        default: ""
+        type: string
+      kicad_image:
+        description: KiCad Docker image used for DRC and exports.
+        required: false
+        default: "kicad/kicad:10.0-full"
+        type: string
+      runner:
+        description: GitHub-hosted or self-hosted runner label.
+        required: false
+        default: "ubuntu-latest"
+        type: string
+      timezone:
+        description: Timezone configured inside the KiCad container.
+        required: false
+        default: "Etc/UTC"
+        type: string
+      variant:
+        description: Optional KiCad variant name for exports that support variants.
+        required: false
+        default: ""
+        type: string
+      define_vars:
+        description: Extra KiCad text variables, one KEY=VALUE pair per line. BRANCH, SHORT_SHA, LONG_SHA, and IS_CI are added automatically.
+        required: false
+        default: ""
+        type: string
+      bom_format_preset:
+        description: KiCad BOM format preset.
+        required: false
+        default: "CSV"
+        type: string
+      bom_fields:
+        description: Comma-separated BOM fields.
+        required: false
+        default: "Reference,Value,Footprint,QUANTITY,DNP"
+        type: string
+      bom_labels:
+        description: Comma-separated BOM column labels.
+        required: false
+        default: "Refs,Value,Footprint,Qty,DNP"
+        type: string
+      bom_group_by:
+        description: Comma-separated BOM grouping fields.
+        required: false
+        default: "Reference,Value,Footprint,DNP"
+        type: string
+      artifact_retention_days:
+        description: Artifact retention period in days.
+        required: false
+        default: 30
+        type: number
+      fail_on_drc_error:
+        description: Fail the workflow when DRC errors are found. Export and release jobs are skipped either way.
+        required: false
+        default: true
+        type: boolean
+      release_enabled:
+        description: Publish a GitHub Release after a successful export.
+        required: false
+        default: true
+        type: boolean
+      release_prerelease:
+        description: Mark the generated release as a pre-release.
+        required: false
+        default: true
+        type: boolean
+      release_draft:
+        description: Create the generated release as a draft.
+        required: false
+        default: false
+        type: boolean
+      release_tag_prefix:
+        description: Prefix for auto-generated CI release tags.
+        required: false
+        default: "ci-build-"
+        type: string
+      release_tag_width:
+        description: Zero-padded numeric width for generated release tags.
+        required: false
+        default: 2
+        type: number
+      release_name_prefix:
+        description: Prefix for the generated release name.
+        required: false
+        default: "CI Build"
+        type: string
+      release_asset_prefix:
+        description: Optional filename prefix for release assets. Defaults to project_name.
+        required: false
+        default: ""
+        type: string
+    outputs:
+      short_sha:
+        description: Seven-character commit SHA used in artifact and release asset names.
+        value: ${{ jobs.drc-check.outputs.short_sha }}
+      release_tag:
+        description: Generated release tag. Empty when release_enabled is false.
+        value: ${{ jobs.publish-release.outputs.release_tag }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  drc-check:
+    name: KiCad DRC
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: ${{ inputs.kicad_image }}
+      options: --user root
+    outputs:
+      proceed: ${{ steps.drc-gate.outputs.proceed }}
+      short_sha: ${{ steps.sha.outputs.short_sha }}
+    env:
+      PROJECT_NAME: ${{ inputs.project_name }}
+      PROJECT_DIR: ${{ inputs.project_directory }}
+      BOARD_FILE_INPUT: ${{ inputs.board_file }}
+      SCHEMATIC_FILE_INPUT: ${{ inputs.schematic_file }}
+      TIMEZONE: ${{ inputs.timezone }}
+      KICAD_CONFIG_VERSION: "10.0"
+      KICAD_VARIANT: ${{ inputs.variant }}
+      EXTRA_DEFINE_VARS: ${{ inputs.define_vars }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install DRC tools
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates jq tzdata
+
+      - name: Configure timezone
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$TIMEZONE" && -f "/usr/share/zoneinfo/$TIMEZONE" ]]; then
+            ln -snf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+            echo "$TIMEZONE" > /etc/timezone
+          else
+            echo "::warning::Timezone '$TIMEZONE' was not found. Keeping the container default timezone."
+          fi
+
+      - name: Configure KiCad global library tables
+        run: |
+          set -euo pipefail
+
+          export KICAD_CONFIG_HOME="$HOME/.config/kicad"
+          kicad_config_dir="$KICAD_CONFIG_HOME/$KICAD_CONFIG_VERSION"
+          mkdir -p "$kicad_config_dir"
+
+          echo "KICAD_CONFIG_HOME=$KICAD_CONFIG_HOME" >> "$GITHUB_ENV"
+
+          find_template() {
+            local filename="$1"
+            local candidates=(
+              "${KICAD_STOCK_DATA_HOME:-}/template/$filename"
+              "/usr/share/kicad/template/$filename"
+              "/usr/local/share/kicad/template/$filename"
+            )
+
+            local candidate
+            for candidate in "${candidates[@]}"; do
+              if [[ -n "$candidate" && -f "$candidate" ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+
+            find /usr/share /usr/local/share \
+              -path "*/template/$filename" \
+              -type f \
+              -print \
+              -quit 2>/dev/null
+          }
+
+          fp_template="$(find_template fp-lib-table)"
+          sym_template="$(find_template sym-lib-table)"
+
+          if [[ -z "$fp_template" || ! -f "$fp_template" ]]; then
+            echo "::error::Could not find KiCad default fp-lib-table template."
+            exit 1
+          fi
+
+          if [[ -z "$sym_template" || ! -f "$sym_template" ]]; then
+            echo "::error::Could not find KiCad default sym-lib-table template."
+            exit 1
+          fi
+
+          cp "$fp_template" "$kicad_config_dir/fp-lib-table"
+          cp "$sym_template" "$kicad_config_dir/sym-lib-table"
+
+          echo "::notice::Copied default global fp-lib-table to $kicad_config_dir/fp-lib-table"
+          echo "::notice::Copied default global sym-lib-table to $kicad_config_dir/sym-lib-table"
+
+      - name: Resolve KiCad project files
+        id: paths
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
+
+          board_file="${BOARD_FILE_INPUT:-${PROJECT_NAME}.kicad_pcb}"
+          schematic_file="${SCHEMATIC_FILE_INPUT:-${PROJECT_NAME}.kicad_sch}"
+
+          if [[ ! -f "$board_file" ]]; then
+            echo "::error::Board file not found: $PROJECT_DIR/$board_file"
+            exit 1
+          fi
+
+          if [[ ! -f "$schematic_file" ]]; then
+            echo "::error::Schematic file not found: $PROJECT_DIR/$schematic_file"
+            exit 1
+          fi
+
+          echo "board_file=$board_file" >> "$GITHUB_OUTPUT"
+          echo "schematic_file=$schematic_file" >> "$GITHUB_OUTPUT"
+
+      - name: Derive commit SHAs
+        id: sha
+        run: |
+          set -euo pipefail
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "long_sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Create KiCad CI helper script
+        run: |
+          set -euo pipefail
+
+          cat > "$GITHUB_WORKSPACE/kicad-ci-common.sh" <<'EOF'
+          set -euo pipefail
+
+          enter_project_dir() {
+            cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
+          }
+
+          init_kicad_cli_args() {
+            define_args=(
+              -D "BRANCH=${GITHUB_REF_NAME}"
+              -D "SHORT_SHA=${SHORT_SHA}"
+              -D "LONG_SHA=${GITHUB_SHA}"
+              -D "IS_CI=1"
+            )
+
+            while IFS= read -r define_var; do
+              [[ -z "$define_var" || "$define_var" =~ ^[[:space:]]*# ]] && continue
+              define_args+=(-D "$define_var")
+            done <<< "${EXTRA_DEFINE_VARS:-}"
+
+            variant_args=()
+            if [[ -n "${KICAD_VARIANT:-}" ]]; then
+              variant_args+=(--variant "$KICAD_VARIANT")
+            fi
+          }
+          EOF
+
+      - name: Generate DRC JSON reports
+        env:
+          SHORT_SHA: ${{ steps.sha.outputs.short_sha }}
+          BOARD_FILE: ${{ steps.paths.outputs.board_file }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
+          enter_project_dir
+          init_kicad_cli_args
+
+          mkdir -p outputs/drc
+
+          for severity in all warning exclusions; do
+            echo "::group::Running KiCad DRC report: $severity"
+            kicad-cli pcb drc \
+              --format json \
+              --schematic-parity \
+              --severity-${severity} \
+              -o "outputs/drc/${PROJECT_NAME}-drc-report-${severity}.json" \
+              "${define_args[@]}" \
+              "$BOARD_FILE"
+            echo "::endgroup::"
+          done
+
+      - name: Run DRC gate
+        id: drc-gate
+        env:
+          SHORT_SHA: ${{ steps.sha.outputs.short_sha }}
+          BOARD_FILE: ${{ steps.paths.outputs.board_file }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
+          enter_project_dir
+          init_kicad_cli_args
+
+          set +e
+          kicad-cli pcb drc \
+            --format json \
+            --schematic-parity \
+            --severity-error \
+            --exit-code-violations \
+            -o "outputs/drc/${PROJECT_NAME}-drc-report-error.json" \
+            "${define_args[@]}" \
+            "$BOARD_FILE"
+          drc_status=$?
+          set -e
+
+          if [[ ! -f "outputs/drc/${PROJECT_NAME}-drc-report-error.json" ]]; then
+            echo "::error::KiCad DRC did not produce the expected error-level JSON report."
+            exit 1
+          fi
+
+          if [[ "$drc_status" -eq 0 ]]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::KiCad DRC passed with no error-level violations."
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::error::KiCad DRC found error-level violations. Export and release jobs will be skipped."
+          fi
+
+      - name: Emit KiCad DRC annotations
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
+
+          report="outputs/drc/${PROJECT_NAME}-drc-report-all.json"
+
+          escape_annotation() {
+            local value="$1"
+            value="${value//'%'/'%25'}"
+            value="${value//$'\r'/'%0D'}"
+            value="${value//$'\n'/'%0A'}"
+            printf '%s' "$value"
+          }
+
+          if [[ ! -f "$report" ]]; then
+            echo "::warning::DRC report not found: $report"
+            exit 0
+          fi
+
+          jq -c '(.violations // [])[]' "$report" | while IFS= read -r violation; do
+            description=$(jq -r '.description // "No description"' <<< "$violation")
+            severity=$(jq -r '.severity // "notice"' <<< "$violation")
+            items=$(jq -r '[.items[]?.description] | join(", ")' <<< "$violation")
+
+            command="notice"
+            if [[ "$severity" == "warning" ]]; then
+              command="warning"
+            elif [[ "$severity" == "error" ]]; then
+              command="error"
+            fi
+
+            message="${severity} - ${description}"
+            if [[ -n "$items" ]]; then
+              message="$message - $items"
+            fi
+
+            echo "::$command title=KiCad DRC::$(escape_annotation "$message")"
+          done
+
+      - name: Upload DRC JSON reports
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: drc-reports-${{ steps.sha.outputs.short_sha }}
+          path: ${{ inputs.project_directory }}/outputs/drc
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: ignore
+
+      - name: Fail workflow on DRC errors
+        if: ${{ steps.drc-gate.outputs.proceed == 'false' && inputs.fail_on_drc_error }}
+        run: exit 1
+
+  package-files:
+    name: Export KiCad manufacturing files
+    needs: drc-check
+    if: ${{ needs.drc-check.outputs.proceed == 'true' }}
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: ${{ inputs.kicad_image }}
+      options: --user root
+    outputs:
+      short_sha: ${{ needs.drc-check.outputs.short_sha }}
+      top_image: ${{ steps.assemble-assets.outputs.top_image }}
+      bottom_image: ${{ steps.assemble-assets.outputs.bottom_image }}
+      schematic_image: ${{ steps.assemble-assets.outputs.schematic_image }}
+    env:
+      PROJECT_NAME: ${{ inputs.project_name }}
+      PROJECT_DIR: ${{ inputs.project_directory }}
+      BOARD_FILE_INPUT: ${{ inputs.board_file }}
+      SCHEMATIC_FILE_INPUT: ${{ inputs.schematic_file }}
+      TIMEZONE: ${{ inputs.timezone }}
+      KICAD_CONFIG_VERSION: "10.0"
+      KICAD_VARIANT: ${{ inputs.variant }}
+      EXTRA_DEFINE_VARS: ${{ inputs.define_vars }}
+      BOM_FORMAT_PRESET: ${{ inputs.bom_format_preset }}
+      BOM_FIELDS: ${{ inputs.bom_fields }}
+      BOM_LABELS: ${{ inputs.bom_labels }}
+      BOM_GROUP_BY: ${{ inputs.bom_group_by }}
+      RELEASE_ASSET_PREFIX_INPUT: ${{ inputs.release_asset_prefix }}
+      SHORT_SHA: ${{ needs.drc-check.outputs.short_sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install export tools
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates imagemagick inkscape jq tzdata zip
+
+      - name: Configure timezone
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$TIMEZONE" && -f "/usr/share/zoneinfo/$TIMEZONE" ]]; then
+            ln -snf "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+            echo "$TIMEZONE" > /etc/timezone
+          else
+            echo "::warning::Timezone '$TIMEZONE' was not found. Keeping the container default timezone."
+          fi
+
+      - name: Configure KiCad global library tables
+        run: |
+          set -euo pipefail
+
+          export KICAD_CONFIG_HOME="$HOME/.config/kicad"
+          kicad_config_dir="$KICAD_CONFIG_HOME/$KICAD_CONFIG_VERSION"
+          mkdir -p "$kicad_config_dir"
+
+          echo "KICAD_CONFIG_HOME=$KICAD_CONFIG_HOME" >> "$GITHUB_ENV"
+
+          find_template() {
+            local filename="$1"
+            local candidates=(
+              "${KICAD_STOCK_DATA_HOME:-}/template/$filename"
+              "/usr/share/kicad/template/$filename"
+              "/usr/local/share/kicad/template/$filename"
+            )
+
+            local candidate
+            for candidate in "${candidates[@]}"; do
+              if [[ -n "$candidate" && -f "$candidate" ]]; then
+                printf '%s\n' "$candidate"
+                return 0
+              fi
+            done
+
+            find /usr/share /usr/local/share \
+              -path "*/template/$filename" \
+              -type f \
+              -print \
+              -quit 2>/dev/null
+          }
+
+          fp_template="$(find_template fp-lib-table)"
+          sym_template="$(find_template sym-lib-table)"
+
+          if [[ -z "$fp_template" || ! -f "$fp_template" ]]; then
+            echo "::error::Could not find KiCad default fp-lib-table template."
+            exit 1
+          fi
+
+          if [[ -z "$sym_template" || ! -f "$sym_template" ]]; then
+            echo "::error::Could not find KiCad default sym-lib-table template."
+            exit 1
+          fi
+
+          cp "$fp_template" "$kicad_config_dir/fp-lib-table"
+          cp "$sym_template" "$kicad_config_dir/sym-lib-table"
+
+          echo "::notice::Copied default global fp-lib-table to $kicad_config_dir/fp-lib-table"
+          echo "::notice::Copied default global sym-lib-table to $kicad_config_dir/sym-lib-table"
+
+      - name: Resolve KiCad project files
+        id: paths
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
+
+          board_file="${BOARD_FILE_INPUT:-${PROJECT_NAME}.kicad_pcb}"
+          schematic_file="${SCHEMATIC_FILE_INPUT:-${PROJECT_NAME}.kicad_sch}"
+
+          if [[ ! -f "$board_file" ]]; then
+            echo "::error::Board file not found: $PROJECT_DIR/$board_file"
+            exit 1
+          fi
+
+          if [[ ! -f "$schematic_file" ]]; then
+            echo "::error::Schematic file not found: $PROJECT_DIR/$schematic_file"
+            exit 1
+          fi
+
+          echo "board_file=$board_file" >> "$GITHUB_OUTPUT"
+          echo "schematic_file=$schematic_file" >> "$GITHUB_OUTPUT"
+
+      - name: Create KiCad CI helper script
+        run: |
+          set -euo pipefail
+
+          cat > "$GITHUB_WORKSPACE/kicad-ci-common.sh" <<'EOF'
+          set -euo pipefail
+
+          enter_project_dir() {
+            cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
+          }
+
+          init_kicad_cli_args() {
+            define_args=(
+              -D "BRANCH=${GITHUB_REF_NAME}"
+              -D "SHORT_SHA=${SHORT_SHA}"
+              -D "LONG_SHA=${GITHUB_SHA}"
+              -D "IS_CI=1"
+            )
+
+            while IFS= read -r define_var; do
+              [[ -z "$define_var" || "$define_var" =~ ^[[:space:]]*# ]] && continue
+              define_args+=(-D "$define_var")
+            done <<< "${EXTRA_DEFINE_VARS:-}"
+
+            variant_args=()
+            if [[ -n "${KICAD_VARIANT:-}" ]]; then
+              variant_args+=(--variant "$KICAD_VARIANT")
+            fi
+          }
+          EOF
+
+      - name: Prepare output directories
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
+
+          rm -rf outputs dist
+          mkdir -p outputs/{gerber,pnp,step,vrml,bom,netlist,schematic,svg,png} dist
+
+      - name: Export Gerber files
+        env:
+          BOARD_FILE: ${{ steps.paths.outputs.board_file }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
+          enter_project_dir
+          init_kicad_cli_args
+
+          kicad-cli pcb export gerbers \
+            --subtract-soldermask \
+            --board-plot-params \
+            -o outputs/gerber/ \
+            "${define_args[@]}" \
+            "${variant_args[@]}" \
+            "$BOARD_FILE"
+
+      - name: Export drill files
+        env:
+          BOARD_FILE: ${{ steps.paths.outputs.board_file }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
+          enter_project_dir
+
+          kicad-cli pcb export drill \
+            -o outputs/gerber/ \
+            --format excellon \
+            --drill-origin absolute \
+            --excellon-units mm \
+            --excellon-separate-th \
+            --generate-map \
+            --map-format gerberx2 \
+            "$BOARD_FILE"
+
+      - name: Export pick-and-place files
+        env:
+          BOARD_FILE: ${{ steps.paths.outputs.board_file }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
+          enter_project_dir
+          init_kicad_cli_args
+
+          kicad-cli pcb export pos \
+            -o "outputs/pnp/${PROJECT_NAME}-top-pos.csv" \
+            --side front \
+            --format csv \
+            --units mm \
+            --exclude-dnp \
+            "${variant_args[@]}" \
+            "$BOARD_FILE"
+
+          kicad-cli pcb export pos \
+            -o "outputs/pnp/${PROJECT_NAME}-bottom-pos.csv" \
+            --side back \
+            --format csv \
+            --units mm \
+            --exclude-dnp \
+            "${variant_args[@]}" \
+            "$BOARD_FILE"
+
+      - name: Export 3D models
+        env:
+          BOARD_FILE: ${{ steps.paths.outputs.board_file }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
+          enter_project_dir
+          init_kicad_cli_args
+
+          kicad-cli pcb export step \
+            -o "outputs/step/${PROJECT_NAME}.step" \
+            --no-dnp \
+            --subst-models \
+            --include-tracks \
+            --include-zones \
+            --include-silkscreen \
+            --include-soldermask \
+            "${define_args[@]}" \
+            "${variant_args[@]}" \
+            "$BOARD_FILE"
+
+          kicad-cli pcb export vrml \
+            -o "outputs/vrml/${PROJECT_NAME}.wrl" \
+            --units mm \
+            --models-dir "outputs/vrml/${PROJECT_NAME}.wrl.modules" \
+            --models-relative \
+            "${define_args[@]}" \
+            "${variant_args[@]}" \
+            "$BOARD_FILE"
+
+      - name: Export board SVG layers
+        env:
+          BOARD_FILE: ${{ steps.paths.outputs.board_file }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
+          enter_project_dir
+          init_kicad_cli_args
+
+          for layer in F.Silkscreen F.Paste F.Mask F.Fab F.Cu; do
+            kicad-cli pcb export svg \
+              -o "outputs/svg/${PROJECT_NAME}-${layer}.svg" \
+              --fit-page-to-board \
+              --layers "$layer" \
+              --mode-single \
+              "${define_args[@]}" \
+              "${variant_args[@]}" \
+              "$BOARD_FILE"
+          done
+
+          for layer in B.Silkscreen B.Paste B.Mask B.Fab B.Cu; do
+            kicad-cli pcb export svg \
+              -o "outputs/svg/${PROJECT_NAME}-${layer}.svg" \
+              --fit-page-to-board \
+              --mirror \
+              --layers "$layer" \
+              --mode-single \
+              "${define_args[@]}" \
+              "${variant_args[@]}" \
+              "$BOARD_FILE"
+          done
+
+          kicad-cli pcb export svg \
+            -o "outputs/svg/${PROJECT_NAME}-Edge.Cuts.svg" \
+            --fit-page-to-board \
+            --layers Edge.Cuts \
+            --mode-single \
+            "${define_args[@]}" \
+            "${variant_args[@]}" \
+            "$BOARD_FILE"
+
+          kicad-cli pcb export svg \
+            -o "outputs/svg/${PROJECT_NAME}-Edge.Cuts-mirrored.svg" \
+            --fit-page-to-board \
+            --mirror \
+            --layers Edge.Cuts \
+            --mode-single \
+            "${define_args[@]}" \
+            "${variant_args[@]}" \
+            "$BOARD_FILE"
+
+      - name: Export schematic files
+        env:
+          SCHEMATIC_FILE: ${{ steps.paths.outputs.schematic_file }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
+          enter_project_dir
+          init_kicad_cli_args
+
+          kicad-cli sch export netlist \
+            -o "outputs/netlist/${PROJECT_NAME}.kicadsexpr.net" \
+            --format kicadsexpr \
+            "${variant_args[@]}" \
+            "$SCHEMATIC_FILE"
+
+          kicad-cli sch export netlist \
+            -o "outputs/netlist/${PROJECT_NAME}.kicadxml.net" \
+            --format kicadxml \
+            "${variant_args[@]}" \
+            "$SCHEMATIC_FILE"
+
+          kicad-cli sch export pdf \
+            -o "outputs/schematic/${PROJECT_NAME}-schematic.pdf" \
+            --no-background-color \
+            "${define_args[@]}" \
+            "${variant_args[@]}" \
+            "$SCHEMATIC_FILE"
+
+          kicad-cli sch export bom \
+            -o "outputs/bom/${PROJECT_NAME}-bom.csv" \
+            --format-preset "$BOM_FORMAT_PRESET" \
+            --fields "$BOM_FIELDS" \
+            --labels "$BOM_LABELS" \
+            --group-by "$BOM_GROUP_BY" \
+            "${variant_args[@]}" \
+            "$SCHEMATIC_FILE"
+
+      - name: Rasterise board SVG layers to PNG
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
+
+          for svg in outputs/svg/*.svg; do
+            png="outputs/png/$(basename "$svg" .svg).png"
+            inkscape --export-filename "$png" --export-dpi 960 "$svg"
+          done
+
+      - name: Compose board preview PNGs
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
+
+          if command -v magick >/dev/null 2>&1; then
+            im_convert=(magick)
+          else
+            im_convert=(convert)
+          fi
+
+          "${im_convert[@]}" \
+            \( "outputs/png/${PROJECT_NAME}-F.Cu.png"         -alpha set -channel A -evaluate multiply 1.00 \) \
+            \( "outputs/png/${PROJECT_NAME}-F.Mask.png"       -alpha set -channel A -evaluate multiply 0.40 \) \
+            \( "outputs/png/${PROJECT_NAME}-F.Paste.png"      -alpha set -channel A -evaluate multiply 0.40 \) \
+            \( "outputs/png/${PROJECT_NAME}-F.Silkscreen.png" -alpha set -channel A -evaluate multiply 0.95 \) \
+            \( "outputs/png/${PROJECT_NAME}-F.Fab.png"        -alpha set -channel A -evaluate multiply 0.95 \) \
+            \( "outputs/png/${PROJECT_NAME}-Edge.Cuts.png"    -alpha set -channel A -evaluate multiply 1.00 \) \
+            -background none -layers merge +repage "outputs/png/${PROJECT_NAME}-top.png"
+
+          "${im_convert[@]}" \
+            \( "outputs/png/${PROJECT_NAME}-B.Cu.png"               -alpha set -channel A -evaluate multiply 1.00 \) \
+            \( "outputs/png/${PROJECT_NAME}-B.Mask.png"             -alpha set -channel A -evaluate multiply 0.40 \) \
+            \( "outputs/png/${PROJECT_NAME}-B.Paste.png"            -alpha set -channel A -evaluate multiply 0.40 \) \
+            \( "outputs/png/${PROJECT_NAME}-B.Silkscreen.png"       -alpha set -channel A -evaluate multiply 0.90 \) \
+            \( "outputs/png/${PROJECT_NAME}-B.Fab.png"              -alpha set -channel A -evaluate multiply 0.95 \) \
+            \( "outputs/png/${PROJECT_NAME}-Edge.Cuts-mirrored.png" -alpha set -channel A -evaluate multiply 1.00 \) \
+            -background none -layers merge +repage "outputs/png/${PROJECT_NAME}-bottom.png"
+
+      - name: Render schematic preview PNG
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
+
+          inkscape \
+            --export-filename "outputs/png/${PROJECT_NAME}-schematic.png" \
+            --export-dpi 384 \
+            "outputs/schematic/${PROJECT_NAME}-schematic.pdf"
+
+      - name: Assemble release assets
+        id: assemble-assets
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
+
+          asset_prefix="${RELEASE_ASSET_PREFIX_INPUT:-$PROJECT_NAME}"
+          asset_prefix="$(printf '%s' "$asset_prefix" | tr -cs 'A-Za-z0-9._-' '-')"
+          asset_prefix="${asset_prefix%-}"
+          asset_prefix="${asset_prefix#-}"
+
+          gerber_zip="${asset_prefix}-Gerber-${SHORT_SHA}.zip"
+          pnp_zip="${asset_prefix}-PNP-${SHORT_SHA}.zip"
+          step_zip="${asset_prefix}-STEP-${SHORT_SHA}.zip"
+          vrml_zip="${asset_prefix}-VRML-${SHORT_SHA}.zip"
+          netlist_zip="${asset_prefix}-Netlist-${SHORT_SHA}.zip"
+          svg_zip="${asset_prefix}-SVG-${SHORT_SHA}.zip"
+          schematic_pdf="${asset_prefix}-Schematic-${SHORT_SHA}.pdf"
+          bom_csv="${asset_prefix}-BOM-${SHORT_SHA}.csv"
+          top_image="${asset_prefix}-Top-${SHORT_SHA}.png"
+          bottom_image="${asset_prefix}-Bottom-${SHORT_SHA}.png"
+          schematic_image="${asset_prefix}-Schematic-${SHORT_SHA}.png"
+
+          (cd outputs/gerber && zip -r "../../dist/$gerber_zip" .)
+          (cd outputs/pnp && zip -r "../../dist/$pnp_zip" .)
+          (cd outputs/step && zip -r "../../dist/$step_zip" .)
+          (cd outputs/vrml && zip -r "../../dist/$vrml_zip" .)
+          (cd outputs/netlist && zip -r "../../dist/$netlist_zip" .)
+          (cd outputs/svg && zip -r "../../dist/$svg_zip" .)
+
+          cp "outputs/schematic/${PROJECT_NAME}-schematic.pdf" "dist/$schematic_pdf"
+          cp "outputs/bom/${PROJECT_NAME}-bom.csv" "dist/$bom_csv"
+          cp "outputs/png/${PROJECT_NAME}-top.png" "dist/$top_image"
+          cp "outputs/png/${PROJECT_NAME}-bottom.png" "dist/$bottom_image"
+          cp "outputs/png/${PROJECT_NAME}-schematic.png" "dist/$schematic_image"
+
+          echo "top_image=$top_image" >> "$GITHUB_OUTPUT"
+          echo "bottom_image=$bottom_image" >> "$GITHUB_OUTPUT"
+          echo "schematic_image=$schematic_image" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release asset bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-${{ needs.drc-check.outputs.short_sha }}
+          path: ${{ inputs.project_directory }}/dist
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: error
+
+      - name: Upload raw exported files
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-kicad-outputs-${{ needs.drc-check.outputs.short_sha }}
+          path: ${{ inputs.project_directory }}/outputs
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: package-files
+    if: ${{ inputs.release_enabled && needs.package-files.result == 'success' }}
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.calculate-tag.outputs.next_tag }}
+    env:
+      PROJECT_NAME: ${{ inputs.project_name }}
+      KICAD_IMAGE: ${{ inputs.kicad_image }}
+      TOP_IMAGE: ${{ needs.package-files.outputs.top_image }}
+      BOTTOM_IMAGE: ${{ needs.package-files.outputs.bottom_image }}
+      SCHEMATIC_IMAGE: ${{ needs.package-files.outputs.schematic_image }}
+
+    steps:
+      - name: Checkout repository with tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets-${{ needs.package-files.outputs.short_sha }}
+          path: release-assets
+
+      - name: Compute next CI release tag
+        id: calculate-tag
+        run: |
+          set -euo pipefail
+
+          git fetch --tags --force
+
+          prefix="${{ inputs.release_tag_prefix }}"
+          width="${{ inputs.release_tag_width }}"
+          latest_number=0
+
+          while IFS= read -r tag; do
+            number="${tag#"$prefix"}"
+            if [[ "$number" =~ ^[0-9]+$ ]] && (( 10#$number > latest_number )); then
+              latest_number=$((10#$number))
+            fi
+          done < <(git tag -l "${prefix}*")
+
+          next_number=$((latest_number + 1))
+          printf -v next_tag "%s%0*d" "$prefix" "$width" "$next_number"
+
+          echo "next_tag=$next_tag" >> "$GITHUB_OUTPUT"
+          echo "next_number=$next_number" >> "$GITHUB_OUTPUT"
+          echo "Next tag: $next_tag"
+
+      - name: Compose release body
+        run: |
+          set -euo pipefail
+
+          tag="${{ steps.calculate-tag.outputs.next_tag }}"
+          base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+
+          cat > release-body.md <<EOF
+          This is an automated KiCad CI build. Use the generated manufacturing files at your own risk.
+
+          Commit: ${GITHUB_SHA}
+          KiCad image: ${KICAD_IMAGE}
+          Project: ${PROJECT_NAME}
+
+          ## Previews
+
+          ![Top board preview](${base_url}/${TOP_IMAGE})
+
+          ![Bottom board preview](${base_url}/${BOTTOM_IMAGE})
+
+          ![Schematic preview](${base_url}/${SCHEMATIC_IMAGE})
+          EOF
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          name: "${{ inputs.release_name_prefix }} #${{ steps.calculate-tag.outputs.next_number }}"
+          tag_name: ${{ steps.calculate-tag.outputs.next_tag }}
+          target_commitish: ${{ github.sha }}
+          draft: ${{ inputs.release_draft }}
+          prerelease: ${{ inputs.release_prerelease }}
+          body_path: release-body.md
+          files: release-assets/*

@@ -1,0 +1,27 @@
+name: KiCad PCB CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - "LICENSE"
+      - "docs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  kicad-ci:
+    uses: acha666/kicad-ci/.github/workflows/kicad-ci.yml@dev
+    with:
+      project_name: PoE_Splitter
+      kicad_image: kicad/kicad:10.0-full
+      timezone: Asia/Shanghai
+      release_enabled: true
+      release_prerelease: true
+      release_tag_prefix: ci-build-
+      bom_fields: Reference,Value,Rated Power,Rated Voltage,Footprint,QUANTITY,Notes,DNP
+      bom_labels: Refs,Value,Rated Power,Rated Voltage,Footprint,Qty,Note,DNP
+      bom_group_by: Reference,Value,Rated Power,Rated Voltage,Footprint,DNP
