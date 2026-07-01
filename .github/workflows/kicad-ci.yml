@@ -112,6 +112,16 @@ on:
         required: false
         default: ""
         type: string
+      render_width:
+        description: Width in pixels for high-quality PCB render previews.
+        required: false
+        default: 3840
+        type: number
+      render_height:
+        description: Height in pixels for high-quality PCB render previews.
+        required: false
+        default: 2160
+        type: number
     outputs:
       short_sha:
         description: Seven-character commit SHA used in artifact and release asset names.
@@ -422,6 +432,8 @@ jobs:
       BOM_LABELS: ${{ inputs.bom_labels }}
       BOM_GROUP_BY: ${{ inputs.bom_group_by }}
       RELEASE_ASSET_PREFIX_INPUT: ${{ inputs.release_asset_prefix }}
+      RENDER_WIDTH: ${{ inputs.render_width }}
+      RENDER_HEIGHT: ${{ inputs.render_height }}
       SHORT_SHA: ${{ needs.drc-check.outputs.short_sha }}
 
     steps:
@@ -433,7 +445,7 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y --no-install-recommends ca-certificates imagemagick inkscape jq poppler-utils tzdata zip
+          apt-get install -y --no-install-recommends ca-certificates imagemagick jq poppler-utils tzdata zip
 
       - name: Configure timezone
         run: |
@@ -557,7 +569,21 @@ jobs:
           cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
 
           rm -rf outputs dist
-          mkdir -p outputs/{gerber,pnp,step,vrml,bom,netlist,schematic,svg,png} dist
+          mkdir -p \
+            outputs/gerber \
+            outputs/pnp \
+            outputs/step \
+            outputs/vrml \
+            outputs/bom \
+            outputs/netlist/schematic \
+            outputs/netlist/board \
+            outputs/schematic \
+            outputs/svg \
+            outputs/png \
+            outputs/render \
+            outputs/stats \
+            outputs/release \
+            dist
 
       - name: Export Gerber files
         env:
@@ -716,6 +742,80 @@ jobs:
             "${variant_args[@]}" \
             "$BOARD_FILE"
 
+      - name: Render high-resolution board previews
+        env:
+          BOARD_FILE: ${{ steps.paths.outputs.board_file }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
+          enter_project_dir
+          init_kicad_cli_args
+
+          for side in top bottom; do
+            kicad-cli pcb render \
+              -o "outputs/render/${PROJECT_NAME}-${side}-render.png" \
+              --side "$side" \
+              --quality high \
+              --width "$RENDER_WIDTH" \
+              --height "$RENDER_HEIGHT" \
+              --background opaque \
+              "${define_args[@]}" \
+              "${variant_args[@]}" \
+              "$BOARD_FILE"
+          done
+
+          test -s "outputs/render/${PROJECT_NAME}-top-render.png"
+          test -s "outputs/render/${PROJECT_NAME}-bottom-render.png"
+
+      - name: Export board statistics
+        env:
+          BOARD_FILE: ${{ steps.paths.outputs.board_file }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
+          enter_project_dir
+
+          kicad-cli pcb export stats \
+            -o "outputs/stats/${PROJECT_NAME}-board-stats.json" \
+            --format json \
+            --units mm \
+            "$BOARD_FILE"
+
+          test -s "outputs/stats/${PROJECT_NAME}-board-stats.json"
+
+      - name: Export netlists
+        env:
+          BOARD_FILE: ${{ steps.paths.outputs.board_file }}
+          SCHEMATIC_FILE: ${{ steps.paths.outputs.schematic_file }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
+          enter_project_dir
+          init_kicad_cli_args
+
+          netlist_formats=(
+            kicadsexpr
+            kicadxml
+            cadstar
+            orcadpcb2
+            spice
+            spicemodel
+            pads
+            allegro
+          )
+
+          for format in "${netlist_formats[@]}"; do
+            kicad-cli sch export netlist \
+              -o "outputs/netlist/schematic/${PROJECT_NAME}-${format}.net" \
+              --format "$format" \
+              "${variant_args[@]}" \
+              "$SCHEMATIC_FILE"
+          done
+
+          kicad-cli pcb export ipcd356 \
+            -o "outputs/netlist/board/${PROJECT_NAME}-ipcd356.d356" \
+            "$BOARD_FILE"
+
       - name: Export schematic files
         env:
           SCHEMATIC_FILE: ${{ steps.paths.outputs.schematic_file }}
@@ -724,18 +824,6 @@ jobs:
           source "$GITHUB_WORKSPACE/kicad-ci-common.sh"
           enter_project_dir
           init_kicad_cli_args
-
-          kicad-cli sch export netlist \
-            -o "outputs/netlist/${PROJECT_NAME}.kicadsexpr.net" \
-            --format kicadsexpr \
-            "${variant_args[@]}" \
-            "$SCHEMATIC_FILE"
-
-          kicad-cli sch export netlist \
-            -o "outputs/netlist/${PROJECT_NAME}.kicadxml.net" \
-            --format kicadxml \
-            "${variant_args[@]}" \
-            "$SCHEMATIC_FILE"
 
           kicad-cli sch export pdf \
             -o "outputs/schematic/${PROJECT_NAME}-schematic.pdf" \
@@ -752,45 +840,6 @@ jobs:
             --group-by "$BOM_GROUP_BY" \
             "${variant_args[@]}" \
             "$SCHEMATIC_FILE"
-
-      - name: Rasterise board SVG layers to PNG
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
-
-          for svg in outputs/svg/*.svg; do
-            png="outputs/png/$(basename "$svg" .svg).png"
-            inkscape --export-filename "$png" --export-dpi 960 "$svg"
-          done
-
-      - name: Compose board preview PNGs
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
-
-          if command -v magick >/dev/null 2>&1; then
-            im_convert=(magick)
-          else
-            im_convert=(convert)
-          fi
-
-          "${im_convert[@]}" \
-            \( "outputs/png/${PROJECT_NAME}-F.Cu.png"         -alpha set -channel A -evaluate multiply 1.00 \) \
-            \( "outputs/png/${PROJECT_NAME}-F.Mask.png"       -alpha set -channel A -evaluate multiply 0.40 \) \
-            \( "outputs/png/${PROJECT_NAME}-F.Paste.png"      -alpha set -channel A -evaluate multiply 0.40 \) \
-            \( "outputs/png/${PROJECT_NAME}-F.Silkscreen.png" -alpha set -channel A -evaluate multiply 0.95 \) \
-            \( "outputs/png/${PROJECT_NAME}-F.Fab.png"        -alpha set -channel A -evaluate multiply 0.95 \) \
-            \( "outputs/png/${PROJECT_NAME}-Edge.Cuts.png"    -alpha set -channel A -evaluate multiply 1.00 \) \
-            +channel -background none -layers merge +repage "outputs/png/${PROJECT_NAME}-top.png"
-
-          "${im_convert[@]}" \
-            \( "outputs/png/${PROJECT_NAME}-B.Cu.png"               -alpha set -channel A -evaluate multiply 1.00 \) \
-            \( "outputs/png/${PROJECT_NAME}-B.Mask.png"             -alpha set -channel A -evaluate multiply 0.40 \) \
-            \( "outputs/png/${PROJECT_NAME}-B.Paste.png"            -alpha set -channel A -evaluate multiply 0.40 \) \
-            \( "outputs/png/${PROJECT_NAME}-B.Silkscreen.png"       -alpha set -channel A -evaluate multiply 0.90 \) \
-            \( "outputs/png/${PROJECT_NAME}-B.Fab.png"              -alpha set -channel A -evaluate multiply 0.95 \) \
-            \( "outputs/png/${PROJECT_NAME}-Edge.Cuts-mirrored.png" -alpha set -channel A -evaluate multiply 1.00 \) \
-            +channel -background none -layers merge +repage "outputs/png/${PROJECT_NAME}-bottom.png"
 
       - name: Render schematic preview PNG
         run: |
@@ -869,6 +918,64 @@ jobs:
 
           test -s "$output_png"
 
+      - name: Create release metadata
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/$PROJECT_DIR"
+
+          stats_json="outputs/stats/${PROJECT_NAME}-board-stats.json"
+          stats_md="outputs/release/board-stats.md"
+
+          if [[ ! -s "$stats_json" ]]; then
+            echo "::error::Board statistics JSON not found or empty: $stats_json"
+            exit 1
+          fi
+
+          {
+            echo "| Metric | Value |"
+            echo "| --- | --- |"
+            jq -r '
+              def sum_values($obj; $keys):
+                reduce $keys[] as $key (0; . + (($obj[$key] // 0) | tonumber? // 0));
+
+              [
+                ["Board size", ((.board.width // "n/a") + " x " + (.board.height // "n/a"))],
+                ["Board area", (.board.area // "n/a")],
+                ["Board thickness", (.board.board_thickness // "n/a")],
+                ["Minimum track width", (.board.min_track_width // "n/a")],
+                ["Minimum track clearance", (.board.min_track_clearance // "n/a")],
+                ["Minimum drill diameter", (.board.min_drill_diameter // "n/a")],
+                ["Components", ((.components.total.total // 0) | tostring)],
+                ["SMD / THT components", (((.components.smd.total // 0) | tostring) + " / " + ((.components.tht.total // 0) | tostring))],
+                ["Pads", (sum_values((.pads // {}); ["through_hole", "smd", "connector", "npth", "castellated", "press_fit"]) | tostring)],
+                ["Vias", (sum_values((.vias // {}); ["through", "blind", "buried", "micro"]) | tostring)],
+                ["Copper area (front / back)", ((.board.front_copper_area // "n/a") + " / " + (.board.back_copper_area // "n/a"))]
+              ] | .[] | "| \(.[0]) | \(.[1]) |"
+            ' "$stats_json"
+
+            echo
+            echo "<details>"
+            echo "<summary>Drill hole breakdown</summary>"
+            echo
+
+            hole_count="$(jq '(.drill_holes // []) | length' "$stats_json")"
+            if (( hole_count > 0 )); then
+              echo "| Count | Size | Plated | Source | Layers |"
+              echo "| ---: | --- | --- | --- | --- |"
+              jq -r '
+                (.drill_holes // [])[] |
+                "| \(.count // 0) | \(.x_size // "n/a") x \(.y_size // "n/a") | \(if .plated == true then "Yes" elif .plated == false then "No" else "n/a" end) | \(.source // "n/a") | \(.start_layer // "n/a") to \(.stop_layer // "n/a") |"
+              ' "$stats_json"
+            else
+              echo "No drill hole entries were reported."
+            fi
+
+            echo
+            echo "</details>"
+          } > "$stats_md"
+
+          test -s "$stats_md"
+
       - name: Assemble release assets
         id: assemble-assets
         run: |
@@ -880,17 +987,17 @@ jobs:
           asset_prefix="${asset_prefix%-}"
           asset_prefix="${asset_prefix#-}"
 
-          gerber_zip="${asset_prefix}-Gerber-${SHORT_SHA}.zip"
-          pnp_zip="${asset_prefix}-PNP-${SHORT_SHA}.zip"
+          gerber_zip="${asset_prefix}-Gerber-Drill-${SHORT_SHA}.zip"
+          bom_csv="${asset_prefix}-BOM-${SHORT_SHA}.csv"
+          pnp_zip="${asset_prefix}-Pick-Place-${SHORT_SHA}.zip"
           step_zip="${asset_prefix}-STEP-${SHORT_SHA}.zip"
           vrml_zip="${asset_prefix}-VRML-${SHORT_SHA}.zip"
-          netlist_zip="${asset_prefix}-Netlist-${SHORT_SHA}.zip"
-          svg_zip="${asset_prefix}-SVG-${SHORT_SHA}.zip"
-          schematic_pdf="${asset_prefix}-Schematic-${SHORT_SHA}.pdf"
-          bom_csv="${asset_prefix}-BOM-${SHORT_SHA}.csv"
-          top_image="${asset_prefix}-Top-${SHORT_SHA}.png"
-          bottom_image="${asset_prefix}-Bottom-${SHORT_SHA}.png"
-          schematic_image="${asset_prefix}-Schematic-${SHORT_SHA}.png"
+          netlist_zip="${asset_prefix}-Netlists-${SHORT_SHA}.zip"
+          schematic_pdf="${asset_prefix}-Schematic-PDF-${SHORT_SHA}.pdf"
+          svg_zip="${asset_prefix}-Board-SVG-${SHORT_SHA}.zip"
+          top_image="${asset_prefix}-Top-Render-${SHORT_SHA}.png"
+          bottom_image="${asset_prefix}-Bottom-Render-${SHORT_SHA}.png"
+          schematic_image="${asset_prefix}-Schematic-Preview-${SHORT_SHA}.png"
 
           (cd outputs/gerber && zip -r "../../dist/$gerber_zip" .)
           (cd outputs/pnp && zip -r "../../dist/$pnp_zip" .)
@@ -901,8 +1008,8 @@ jobs:
 
           cp "outputs/schematic/${PROJECT_NAME}-schematic.pdf" "dist/$schematic_pdf"
           cp "outputs/bom/${PROJECT_NAME}-bom.csv" "dist/$bom_csv"
-          cp "outputs/png/${PROJECT_NAME}-top.png" "dist/$top_image"
-          cp "outputs/png/${PROJECT_NAME}-bottom.png" "dist/$bottom_image"
+          cp "outputs/render/${PROJECT_NAME}-top-render.png" "dist/$top_image"
+          cp "outputs/render/${PROJECT_NAME}-bottom-render.png" "dist/$bottom_image"
           cp "outputs/png/${PROJECT_NAME}-schematic.png" "dist/$schematic_image"
 
           echo "top_image=$top_image" >> "$GITHUB_OUTPUT"
@@ -914,6 +1021,14 @@ jobs:
         with:
           name: release-assets-${{ needs.drc-check.outputs.short_sha }}
           path: ${{ inputs.project_directory }}/dist
+          retention-days: ${{ inputs.artifact_retention_days }}
+          if-no-files-found: error
+
+      - name: Upload release metadata
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-metadata-${{ needs.drc-check.outputs.short_sha }}
+          path: ${{ inputs.project_directory }}/outputs/release
           retention-days: ${{ inputs.artifact_retention_days }}
           if-no-files-found: error
 
@@ -953,6 +1068,12 @@ jobs:
           name: release-assets-${{ needs.package-files.outputs.short_sha }}
           path: release-assets
 
+      - name: Download release metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: release-metadata-${{ needs.package-files.outputs.short_sha }}
+          path: release-metadata
+
       - name: Compute next CI release tag
         id: calculate-tag
         run: |
@@ -984,22 +1105,85 @@ jobs:
 
           tag="${{ steps.calculate-tag.outputs.next_tag }}"
           base_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+          stats_file="release-metadata/board-stats.md"
 
-          cat > release-body.md <<EOF
-          This is an automated KiCad CI build. Use the generated manufacturing files at your own risk.
+          if [[ ! -s "$stats_file" ]]; then
+            echo "::error::Release statistics metadata not found: $stats_file"
+            exit 1
+          fi
 
-          Commit: ${GITHUB_SHA}
-          KiCad image: ${KICAD_IMAGE}
-          Project: ${PROJECT_NAME}
+          asset_description() {
+            case "$1" in
+              *-Gerber-Drill-*) printf 'Gerber, Excellon drill, and drill map files' ;;
+              *-BOM-*) printf 'Bill of materials CSV' ;;
+              *-Pick-Place-*) printf 'Top and bottom pick-and-place CSV files' ;;
+              *-STEP-*) printf 'STEP 3D model' ;;
+              *-VRML-*) printf 'VRML 3D model and relative model assets' ;;
+              *-Netlists-*) printf 'Schematic netlists plus board IPC-D-356 netlist' ;;
+              *-Schematic-PDF-*) printf 'Schematic PDF' ;;
+              *-Board-SVG-*) printf 'Board SVG layer exports' ;;
+              *-Top-Render-*) printf 'High-resolution top board render' ;;
+              *-Bottom-Render-*) printf 'High-resolution bottom board render' ;;
+              *-Schematic-Preview-*) printf 'Schematic preview PNG' ;;
+              *) printf 'Release asset' ;;
+            esac
+          }
 
-          ## Previews
+          {
+            echo "Automated KiCad CI build for **${PROJECT_NAME}**."
+            echo
+            echo "Review all generated manufacturing files before fabrication."
+            echo
+            echo "| Project | Commit | KiCad image |"
+            echo "| --- | --- | --- |"
+            echo "| ${PROJECT_NAME} | \`${GITHUB_SHA::7}\` | \`${KICAD_IMAGE}\` |"
+            echo
+            echo "## Board Renders"
+            echo
+            echo "![Top board render](${base_url}/${TOP_IMAGE})"
+            echo
+            echo "![Bottom board render](${base_url}/${BOTTOM_IMAGE})"
+            echo
+            echo "## Board Statistics"
+            echo
+            cat "$stats_file"
+            echo
+            echo "<details>"
+            echo "<summary>Schematic preview</summary>"
+            echo
+            echo "![Schematic preview](${base_url}/${SCHEMATIC_IMAGE})"
+            echo
+            echo "</details>"
+            echo
+            echo "<details>"
+            echo "<summary>Release assets</summary>"
+            echo
+            echo "| Asset | Contents |"
+            echo "| --- | --- |"
 
-          ![Top board preview](${base_url}/${TOP_IMAGE})
+            while IFS= read -r asset_path; do
+              asset="$(basename "$asset_path")"
 
-          ![Bottom board preview](${base_url}/${BOTTOM_IMAGE})
+              printf '| [`%s`](%s/%s) | %s |\n' \
+                "$asset" \
+                "$base_url" \
+                "$asset" \
+                "$(asset_description "$asset")"
+            done < <(find release-assets -maxdepth 1 -type f | sort -V)
 
-          ![Schematic preview](${base_url}/${SCHEMATIC_IMAGE})
-          EOF
+            echo
+            echo "</details>"
+            echo
+            echo "<details>"
+            echo "<summary>Build details</summary>"
+            echo
+            echo "- Release tag: \`${tag}\`"
+            echo "- Source branch: \`${GITHUB_REF_NAME}\`"
+            echo "- Full commit: \`${GITHUB_SHA}\`"
+            echo "- KiCad image: \`${KICAD_IMAGE}\`"
+            echo
+            echo "</details>"
+          } > release-body.md
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v3
