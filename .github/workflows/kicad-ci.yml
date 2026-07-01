@@ -755,7 +755,6 @@ jobs:
             kicad-cli pcb render \
               -o "outputs/render/${PROJECT_NAME}-${side}-render.png" \
               --side "$side" \
-              --quality high \
               --width "$RENDER_WIDTH" \
               --height "$RENDER_HEIGHT" \
               --background opaque \
