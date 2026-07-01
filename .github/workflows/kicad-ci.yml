@@ -149,7 +149,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install DRC tools
         run: |
@@ -384,7 +384,7 @@ jobs:
 
       - name: Upload DRC JSON reports
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: drc-reports-${{ steps.sha.outputs.short_sha }}
           path: ${{ inputs.project_directory }}/outputs/drc
@@ -426,7 +426,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install export tools
         run: |
@@ -910,7 +910,7 @@ jobs:
           echo "schematic_image=$schematic_image" >> "$GITHUB_OUTPUT"
 
       - name: Upload release asset bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-assets-${{ needs.drc-check.outputs.short_sha }}
           path: ${{ inputs.project_directory }}/dist
@@ -918,7 +918,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload raw exported files
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: raw-kicad-outputs-${{ needs.drc-check.outputs.short_sha }}
           path: ${{ inputs.project_directory }}/outputs
@@ -943,7 +943,7 @@ jobs:
 
     steps:
       - name: Checkout repository with tags
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -1002,7 +1002,7 @@ jobs:
           EOF
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
