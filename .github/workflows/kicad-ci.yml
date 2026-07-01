@@ -1063,13 +1063,13 @@ jobs:
           fetch-depth: 0
 
       - name: Download release assets
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: release-assets-${{ needs.package-files.outputs.short_sha }}
           path: release-assets
 
       - name: Download release metadata
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: release-metadata-${{ needs.package-files.outputs.short_sha }}
           path: release-metadata
